@@ -213,15 +213,6 @@ export default function App() {
       },
     });
 
-    // Check for ?pair=CODE query parameter from scanned QR code
-    if (typeof window !== 'undefined') {
-      const params = new URLSearchParams(window.location.search);
-      const pairCode = params.get('pair');
-      if (pairCode) {
-        handleJoinPhoneSession(pairCode.toUpperCase().trim());
-      }
-    }
-
     // Listen for live tab discovery beacons
     const handlePeerDiscovered = (e: any) => {
       const peer = e.detail;
@@ -381,14 +372,14 @@ export default function App() {
   };
 
   // Host universal phone room
-  const handleHostPhoneSession = async (customCode?: string) => {
+  const handleHostPhoneSession = useCallback(async (customCode?: string) => {
     const res = await engineRef.current.hostPhoneRoom(customCode);
     setCurrentPhoneRoomCode(res.code);
     return res;
-  };
+  }, []);
 
   // Join universal phone room
-  const handleJoinPhoneSession = async (code: string) => {
+  const handleJoinPhoneSession = useCallback(async (code: string) => {
     try {
       const dev = await engineRef.current.joinPhoneRoom(code);
       setCurrentPhoneRoomCode(code);
@@ -398,11 +389,34 @@ export default function App() {
         if (prev.some((d) => d.id === dev.id)) return prev;
         return [dev, ...prev];
       });
+
+      const sysMsg: BluetoothMessage = {
+        id: 'sys_' + Date.now(),
+        sender: 'system',
+        text: `Connected to Phone Pairing Session [PIN: ${code}]. Messages and files sync instantly.`,
+        byteLength: 0,
+        timestamp: Date.now(),
+        status: 'delivered',
+      };
+      setMessages((prev) => [...prev, sysMsg]);
     } catch (err: any) {
       console.error('Join phone session error:', err);
       throw err;
     }
-  };
+  }, []);
+
+  // Auto-connect if ?pair=CODE query parameter in URL (e.g. from scanned QR code)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const pairCode = params.get('pair');
+    if (pairCode) {
+      const code = pairCode.toUpperCase().trim();
+      handleJoinPhoneSession(code).catch((err) => {
+        console.warn('Auto pair from QR failed:', err);
+      });
+    }
+  }, [handleJoinPhoneSession]);
 
   // Refresh active nearby phones
   const handleRefreshNearbyPhones = async () => {
@@ -588,6 +602,8 @@ export default function App() {
         localDeviceName={settings.localDeviceName}
         phoneInfo={phoneInfo}
         currentRoomCode={currentPhoneRoomCode}
+        connectionState={connectionState}
+        connectedDevice={connectedDevice}
         onHostNewSession={handleHostPhoneSession}
         onJoinSession={handleJoinPhoneSession}
         onConnectDevice={handleConnectDevice}

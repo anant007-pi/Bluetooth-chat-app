@@ -65,8 +65,11 @@ export class BluetoothEngine {
   private writeChar: any = null;
   private readChar: any = null;
 
-  // Real Phone-to-Phone SSE Relay
+  // Real Phone-to-Phone SSE Relay & Dual-Transport Polling
   private sseSource: EventSource | null = null;
+  private pollInterval: any = null;
+  private processedMessageIds: Set<string> = new Set();
+  private lastPollTimestamp: number = 0;
   private currentRoomCode: string | null = null;
   private phonePeerId: string = 'peer_' + Math.random().toString(36).substring(2, 9);
   private localOs: string = 'Mobile';
@@ -129,22 +132,38 @@ export class BluetoothEngine {
       const devices: BluetoothDeviceItem[] = [];
 
       for (const r of rooms) {
-        for (const p of r.peers) {
-          if (p.id !== this.phonePeerId) {
-            devices.push({
-              id: `room_${r.code}_${p.id}`,
-              name: `${p.name} [PIN: ${r.code}]`,
-              address: p.mac || generateMacAddress(),
-              rssi: p.rssi || -56,
-              type: 'phone',
-              isPaired: false,
-              isVirtual: false,
-              isPhoneRelay: true,
-              relayRoomCode: r.code,
-              os: p.os,
-              mtu: 512,
-            });
+        if (r.code === this.currentRoomCode) continue;
+        if (r.peers && r.peers.length > 0) {
+          for (const p of r.peers) {
+            if (p.id !== this.phonePeerId) {
+              devices.push({
+                id: `room_${r.code}_${p.id}`,
+                name: `${p.name} (PIN: ${r.code})`,
+                address: p.mac || `PIN:${r.code}`,
+                rssi: p.rssi || -56,
+                type: 'phone',
+                isPaired: false,
+                isVirtual: false,
+                isPhoneRelay: true,
+                relayRoomCode: r.code,
+                os: p.os,
+                mtu: 512,
+              });
+            }
           }
+        } else {
+          devices.push({
+            id: `room_${r.code}`,
+            name: `${r.name} (PIN: ${r.code})`,
+            address: `PIN:${r.code}`,
+            rssi: -58,
+            type: 'phone',
+            isPaired: false,
+            isVirtual: false,
+            isPhoneRelay: true,
+            relayRoomCode: r.code,
+            mtu: 512,
+          });
         }
       }
       return devices;
@@ -177,7 +196,7 @@ export class BluetoothEngine {
     }
 
     this.currentRoomCode = code;
-    this.connectSSE(code);
+    this.connectRoomRelay(code);
 
     const placeholderDevice: BluetoothDeviceItem = {
       id: `room_${code}`,
@@ -202,7 +221,7 @@ export class BluetoothEngine {
     this.callbacks?.onLog('SYS', `Pairing to Wireless Phone Session [PIN: ${cleanCode}]...`, '', 0);
 
     this.currentRoomCode = cleanCode;
-    this.connectSSE(cleanCode);
+    this.connectRoomRelay(cleanCode);
 
     const peerDevice: BluetoothDeviceItem = {
       id: `room_${cleanCode}`,
@@ -225,35 +244,60 @@ export class BluetoothEngine {
     return peerDevice;
   }
 
-  private connectSSE(code: string) {
-    if (this.sseSource) {
-      try {
-        this.sseSource.close();
-      } catch {
-        // ignore
-      }
-      this.sseSource = null;
-    }
+  // Dual-Transport: SSE Realtime Stream + Fast HTTP Polling Fallback
+  private connectRoomRelay(code: string) {
+    this.cleanupRoomRelay();
 
-    const url = `/api/rooms/${encodeURIComponent(code)}/events?peerId=${encodeURIComponent(
-      this.phonePeerId
-    )}&name=${encodeURIComponent(this.localName)}&type=phone&os=${encodeURIComponent(
-      this.localOs
-    )}&mac=${encodeURIComponent(this.localMac)}&rssi=-55`;
+    this.processedMessageIds.clear();
+    this.lastPollTimestamp = Date.now() - 5000;
 
-    const source = new EventSource(url);
-    this.sseSource = source;
+    // 1. Establish SSE Connection
+    try {
+      const url = `/api/rooms/${encodeURIComponent(code)}/events?peerId=${encodeURIComponent(
+        this.phonePeerId
+      )}&name=${encodeURIComponent(this.localName)}&type=phone&os=${encodeURIComponent(
+        this.localOs
+      )}&mac=${encodeURIComponent(this.localMac)}&rssi=-55`;
 
-    source.addEventListener('connected', (e: any) => {
-      try {
-        const data = JSON.parse(e.data);
-        if (data.peers && data.peers.length > 0) {
-          const peer = data.peers[0];
+      const source = new EventSource(url);
+      this.sseSource = source;
+
+      source.addEventListener('connected', (e: any) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.peers && data.peers.length > 0) {
+            const peer = data.peers[0];
+            const peerDevice: BluetoothDeviceItem = {
+              id: `room_${code}_${peer.id}`,
+              name: peer.name,
+              address: peer.mac || `PIN:${code}`,
+              rssi: peer.rssi || -55,
+              type: 'phone',
+              isPaired: true,
+              isVirtual: false,
+              isPhoneRelay: true,
+              relayRoomCode: code,
+              os: peer.os,
+              mtu: 512,
+            };
+            this.currentDevice = peerDevice;
+            this.setConnectionState('connected', peerDevice);
+            triggerHaptic('connected');
+            this.callbacks?.onLog('SYS', `Linked to phone: ${peer.name} (${peer.os || 'Mobile'})`, '', 0);
+          }
+        } catch (err) {
+          console.error('SSE connected parse error', err);
+        }
+      });
+
+      source.addEventListener('peer_joined', (e: any) => {
+        try {
+          const peer = JSON.parse(e.data);
           const peerDevice: BluetoothDeviceItem = {
             id: `room_${code}_${peer.id}`,
             name: peer.name,
             address: peer.mac || `PIN:${code}`,
-            rssi: peer.rssi || -55,
+            rssi: peer.rssi || -52,
             type: 'phone',
             isPaired: true,
             isVirtual: false,
@@ -265,78 +309,134 @@ export class BluetoothEngine {
           this.currentDevice = peerDevice;
           this.setConnectionState('connected', peerDevice);
           triggerHaptic('connected');
-          this.callbacks?.onLog('SYS', `Linked to phone: ${peer.name} (${peer.os || 'Mobile'})`, '', 0);
+          this.callbacks?.onLog('SYS', `New phone paired: ${peer.name} [${peer.os}]`, '', 0);
+        } catch (err) {
+          console.error('SSE peer_joined error', err);
         }
-      } catch (err) {
-        console.error('SSE connected parse error', err);
-      }
-    });
+      });
 
-    source.addEventListener('peer_joined', (e: any) => {
-      try {
-        const peer = JSON.parse(e.data);
-        const peerDevice: BluetoothDeviceItem = {
-          id: `room_${code}_${peer.id}`,
-          name: peer.name,
-          address: peer.mac || `PIN:${code}`,
-          rssi: peer.rssi || -52,
-          type: 'phone',
-          isPaired: true,
-          isVirtual: false,
-          isPhoneRelay: true,
-          relayRoomCode: code,
-          os: peer.os,
-          mtu: 512,
-        };
-        this.currentDevice = peerDevice;
-        this.setConnectionState('connected', peerDevice);
-        triggerHaptic('connected');
-        this.callbacks?.onLog('SYS', `New phone paired: ${peer.name} [${peer.os}]`, '', 0);
-      } catch (err) {
-        console.error('SSE peer_joined error', err);
-      }
-    });
+      source.addEventListener('peer_left', (e: any) => {
+        try {
+          const data = JSON.parse(e.data);
+          this.callbacks?.onLog('SYS', `Phone disconnected: ${data.name || 'Remote peer'}`, '', 0);
+        } catch {
+          // ignore
+        }
+      });
 
-    source.addEventListener('peer_left', (e: any) => {
+      source.addEventListener('message', (e: any) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (payload.id && this.processedMessageIds.has(payload.id)) return;
+          if (payload.id) this.processedMessageIds.add(payload.id);
+
+          const text = payload.text;
+          const hex = payload.rawHex || stringToHex(text || '');
+          const bytes = payload.byteLength || (text ? text.length : 0);
+          triggerHaptic('received');
+          this.callbacks?.onDataReceived(text, hex, bytes, payload.fileAttachment);
+          this.callbacks?.onLog('RX', text, hex, bytes);
+        } catch (err) {
+          console.error('SSE message parse error', err);
+        }
+      });
+
+      source.addEventListener('file_message', (e: any) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (payload.id && this.processedMessageIds.has(payload.id)) return;
+          if (payload.id) this.processedMessageIds.add(payload.id);
+
+          const text = payload.text || `[File: ${payload.fileAttachment?.name}]`;
+          const hex = stringToHex(text);
+          const bytes = payload.byteLength || 0;
+          triggerHaptic('received');
+          this.callbacks?.onDataReceived(text, hex, bytes, payload.fileAttachment);
+          this.callbacks?.onLog('RX', text, hex, bytes);
+        } catch (err) {
+          console.error('SSE file_message error', err);
+        }
+      });
+
+      source.onerror = () => {
+        // SSE transient error, HTTP polling fallback handles continuity
+      };
+    } catch (e) {
+      console.warn('SSE initiation notice:', e);
+    }
+
+    // 2. Continuous HTTP Polling Fallback (runs every 800ms)
+    this.pollInterval = setInterval(async () => {
+      if (!this.currentRoomCode) return;
       try {
-        const data = JSON.parse(e.data);
-        this.callbacks?.onLog('SYS', `Phone disconnected: ${data.name || 'Remote peer'}`, '', 0);
+        const res = await fetch(
+          `/api/rooms/${encodeURIComponent(code)}/poll?peerId=${encodeURIComponent(
+            this.phonePeerId
+          )}&since=${this.lastPollTimestamp}`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.serverTime) {
+          this.lastPollTimestamp = data.serverTime;
+        }
+
+        // Auto pair if peer detected and we are still disconnected or unlinked
+        if (data.peers && data.peers.length > 0) {
+          const peer = data.peers[0];
+          if (!this.currentDevice || this.connectionState !== 'connected') {
+            const peerDevice: BluetoothDeviceItem = {
+              id: `room_${code}_${peer.id}`,
+              name: peer.name,
+              address: peer.mac || `PIN:${code}`,
+              rssi: peer.rssi || -52,
+              type: 'phone',
+              isPaired: true,
+              isVirtual: false,
+              isPhoneRelay: true,
+              relayRoomCode: code,
+              os: peer.os,
+              mtu: 512,
+            };
+            this.currentDevice = peerDevice;
+            this.setConnectionState('connected', peerDevice);
+            triggerHaptic('connected');
+            this.callbacks?.onLog('SYS', `Phone active: ${peer.name} [${peer.os || 'Mobile'}]`, '', 0);
+          }
+        }
+
+        // Deliver any messages that were not received via SSE
+        if (data.messages && data.messages.length > 0) {
+          for (const msg of data.messages) {
+            if (!this.processedMessageIds.has(msg.id)) {
+              this.processedMessageIds.add(msg.id);
+              const text = msg.text || (msg.fileAttachment ? `[File: ${msg.fileAttachment.name}]` : '');
+              const hex = msg.rawHex || stringToHex(text);
+              const bytes = msg.byteLength || (text ? text.length : 0);
+              triggerHaptic('received');
+              this.callbacks?.onDataReceived(text, hex, bytes, msg.fileAttachment);
+              this.callbacks?.onLog('RX', text, hex, bytes);
+            }
+          }
+        }
+      } catch {
+        // network polling silent retry
+      }
+    }, 800);
+  }
+
+  private cleanupRoomRelay() {
+    if (this.sseSource) {
+      try {
+        this.sseSource.close();
       } catch {
         // ignore
       }
-    });
-
-    source.addEventListener('message', (e: any) => {
-      try {
-        const payload = JSON.parse(e.data);
-        const text = payload.text;
-        const hex = payload.rawHex || stringToHex(text || '');
-        const bytes = payload.byteLength || (text ? text.length : 0);
-        triggerHaptic('received');
-        this.callbacks?.onDataReceived(text, hex, bytes, payload.fileAttachment);
-        this.callbacks?.onLog('RX', text, hex, bytes);
-      } catch (err) {
-        console.error('SSE message parse error', err);
-      }
-    });
-
-    source.addEventListener('file_message', (e: any) => {
-      try {
-        const payload = JSON.parse(e.data);
-        const text = payload.text || `[File: ${payload.fileAttachment?.name}]`;
-        const hex = stringToHex(text);
-        const bytes = payload.byteLength || 0;
-        triggerHaptic('received');
-        this.callbacks?.onDataReceived(text, hex, bytes, payload.fileAttachment);
-        this.callbacks?.onLog('RX', text, hex, bytes);
-      } catch (err) {
-        console.error('SSE file_message error', err);
-      }
-    });
-
-    source.onerror = () => {
-      // SSE auto-reconnects
-    };
+      this.sseSource = null;
+    }
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
   }
 
   public isWebBluetoothSupported(): boolean {
@@ -601,14 +701,8 @@ export class BluetoothEngine {
       });
     }
 
-    if (this.sseSource) {
-      try {
-        this.sseSource.close();
-      } catch {
-        // ignore
-      }
-      this.sseSource = null;
-    }
+    this.cleanupRoomRelay();
+    this.processedMessageIds.clear();
     this.currentRoomCode = null;
 
     await new Promise((resolve) => setTimeout(resolve, 300));
