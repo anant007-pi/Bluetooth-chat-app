@@ -1,0 +1,6 @@
+{
+  "name": "Bluetooth Chat",
+  "description": "Real-time Bluetooth messaging app with universal phone pairing, Web Bluetooth BLE GATT, and cross-device wireless relay.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
